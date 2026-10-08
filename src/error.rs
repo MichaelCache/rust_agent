@@ -27,6 +27,9 @@ pub enum AgentError {
     #[error("LLM 返回了空的 choices（服务端异常）")]
     EmptyChoices,
 
+    #[error("流式响应错误: {0}")]
+    Stream(String),
+
     #[error("MCP 通信错误: {0}")]
     Mcp(#[from] rmcp::service::ServiceError),
 

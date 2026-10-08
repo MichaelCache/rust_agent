@@ -11,12 +11,34 @@ use tracing::warn;
 /// 构造指向 Ollama 的 OpenAI 兼容客户端。
 ///
 /// 注意 base_url 必须带 `/v1` 后缀，Ollama 的兼容层挂在 `http://localhost:11434/v1`。
+/// 对话本身走 [`crate::stream`] 的直连 SSE（async-openai 的流式类型会丢掉
+/// `reasoning` 字段），这个客户端负责非流式接口并持有同一份配置。
 pub fn build_client(base_url: &str, api_key: &str) -> Client<OpenAIConfig> {
-    let config = OpenAIConfig::new()
+    client_with(base_url, api_key, reqwest::Client::new())
+}
+
+/// 用外部传入的 HTTP 客户端构造 LLM 客户端（便于统一超时/连接池配置）。
+pub fn client_with(base_url: &str, api_key: &str, http: reqwest::Client) -> Client<OpenAIConfig> {
+    Client::build(http, client_config(base_url, api_key))
+}
+
+/// async-openai 的配置规则：`{base_url}/chat/completions`。
+///
+/// 流式直连那条路要用 [`chat_completions_url`] 拼出同样的地址。
+pub fn client_config(base_url: &str, api_key: &str) -> OpenAIConfig {
+    OpenAIConfig::new()
         .with_api_base(base_url)
         // Ollama 不校验 key，但字段不能为空
-        .with_api_key(api_key);
-    Client::with_config(config)
+        .with_api_key(api_key)
+}
+
+/// 拼接 chat completions 的完整地址。
+///
+/// 必须复刻 async-openai `get_api_url` 那一步：用户给的 base_url 带不带结尾斜杠
+/// 都得拼对，否则 `.../v1` + `/chat/completions` 会被服务端 307 到带斜杠的地址
+/// （有些服务端还只把裸路径塞进 Location）。
+pub fn chat_completions_url(base_url: &str) -> String {
+    format!("{}/chat/completions", base_url.trim().trim_end_matches('/'))
 }
 
 /// 把 MCP 的 `Tool` 列表转换成 OpenAI 的 `tools` 参数。

@@ -8,6 +8,10 @@ default-run = "rust_agent"
 [dependencies]
 # 0.42 起默认只开 rustls，chat 相关类型必须显式打开 chat-completion feature
 async-openai = { version = "0.42.1", features = ["chat-completion"] }
+# 流式对话：自己读 SSE 字节流（async-openai 的流式类型会丢掉 reasoning 字段）
+futures-util = "0.3"
+# 版本必须与 async-openai 依赖的 reqwest 保持一致，否则类型对不上
+reqwest = { version = "0.13", default-features = false, features = ["json", "stream"] }
 # client: 作为 MCP 客户端连接子进程
 # server: 提供 code-tools-server
 # schemars: #[tool] 需要用它生成 inputSchema

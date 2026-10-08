@@ -5,16 +5,11 @@ use std::{
     time::Duration,
 };
 
-use async_openai::{
-    Client,
-    config::OpenAIConfig,
-    types::chat::{
-        ChatCompletionMessageToolCalls, ChatCompletionRequestAssistantMessageArgs,
-        ChatCompletionRequestMessage, ChatCompletionRequestSystemMessageArgs,
-        ChatCompletionRequestToolMessageArgs, ChatCompletionRequestUserMessageArgs,
-        ChatCompletionTools, CreateChatCompletionRequest, CreateChatCompletionRequestArgs,
-        CreateChatCompletionResponse,
-    },
+use async_openai::types::chat::{
+    ChatCompletionMessageToolCalls, ChatCompletionRequestAssistantMessageArgs,
+    ChatCompletionRequestMessage, ChatCompletionRequestSystemMessageArgs,
+    ChatCompletionRequestToolMessageArgs, ChatCompletionRequestUserMessageArgs,
+    ChatCompletionTools, CreateChatCompletionRequest, CreateChatCompletionRequestArgs,
 };
 use tracing::{debug, info, warn};
 
@@ -22,7 +17,8 @@ use crate::{
     error::{AgentError, Result},
     llm,
     mcp::McpClient,
-    text::{strip_thinking, truncate_with_note},
+    stream::{self, ChatStreamHandler, ChatTurn, HandlerRef},
+    text::truncate_with_note,
     workspace::Workspace,
 };
 
@@ -97,7 +93,8 @@ impl Default for AgentConfig {
 
 pub struct Agent {
     cfg: AgentConfig,
-    llm: Client<OpenAIConfig>,
+    /// 流式对话直连用的 HTTP 客户端
+    http: reqwest::Client,
     mcp: McpClient,
     tools: Vec<ChatCompletionTools>,
     tool_names: Vec<String>,
@@ -130,7 +127,13 @@ impl Agent {
         let tool_names = llm::tool_names(&tools);
         info!(tools = ?tool_names, "工具已就绪");
 
-        let llm = llm::build_client(&cfg.base_url, &cfg.api_key);
+        // 对话本身走下面的流式直连（async-openai 的流式类型会丢掉 reasoning 字段），
+        // 这里只建一个 HTTP 客户端，超时策略由我们按“分片间隔”控制，
+        // 因此明确只设连接超时，避免长回答被 reqwest 整体超时掐断。
+        let http = reqwest::Client::builder()
+            .connect_timeout(cfg.request_timeout)
+            .build()
+            .map_err(|e| AgentError::Stream(format!("构造 HTTP 客户端失败: {e}")))?;
         let system_prompt = cfg
             .system_prompt
             .clone()
@@ -144,7 +147,7 @@ impl Agent {
 
         Ok(Self {
             cfg,
-            llm,
+            http,
             mcp,
             tools,
             tool_names,
@@ -189,7 +192,25 @@ impl Agent {
     }
 
     /// 执行一轮“用户任务 → 最终回答”。
+    ///
+    /// 内部走流式（每来一段就回调），这里只是把事件丢掉、把最终文本收集起来。
+    /// 想在打字过程中实时展示（含思考内容）请用 [`Agent::ask_stream_with`]。
     pub async fn ask(&mut self, task: &str) -> Result<String> {
+        self.ask_stream_with(task, ()).await
+    }
+
+    /// 执行一轮任务，并实时回调每一个流式事件。
+    ///
+    /// `handler` 可以是 `&mut` 闭包，也可以是实现了 [`ChatStreamHandler`] 的类型。
+    /// 回调里收到 [`ChatEvent::Reasoning`] 就是模型的思考过程（Ollama 的
+    /// `reasoning` 字段、其他网关的 `reasoning_content`、以及正文里的思维链标签
+    /// 都会被归到这里），[`ChatEvent::Text`] 是最终回答正文。
+    ///
+    /// 返回值仍是这一轮的最终回答（思考内容已剥离，且不会写回历史）。
+    pub async fn ask_stream_with<H>(&mut self, task: &str, mut handler: H) -> Result<String>
+    where
+        H: ChatStreamHandler + Unpin,
+    {
         let task = task.trim();
         if task.is_empty() {
             return Err(AgentError::Config("任务内容为空".to_string()));
@@ -199,7 +220,7 @@ impl Agent {
         self.history.push(user_message(task)?);
 
         for step in 1..=self.cfg.max_steps {
-            if let Some(answer) = self.step(step).await? {
+            if let Some(answer) = self.step(step, &mut handler).await? {
                 return Ok(answer);
             }
         }
@@ -208,11 +229,14 @@ impl Agent {
             max_steps = self.cfg.max_steps,
             "达到工具调用上限，要求模型直接总结"
         );
-        self.force_final_answer().await
+        self.force_final_answer(&mut handler).await
     }
 
     /// 一轮 LLM 调用。返回 `Some(最终回答)` 表示结束，`None` 表示本轮只调用了工具。
-    async fn step(&mut self, step: usize) -> Result<Option<String>> {
+    async fn step<H>(&mut self, step: usize, handler: &mut H) -> Result<Option<String>>
+    where
+        H: ChatStreamHandler + Unpin,
+    {
         let mut builder = CreateChatCompletionRequestArgs::default();
         builder
             .model(&self.cfg.model)
@@ -225,45 +249,23 @@ impl Agent {
             .build()
             .map_err(|e| AgentError::Request(e.to_string()))?;
 
-        let response = self.chat(request).await?;
-        if let Some(usage) = &response.usage {
-            debug!(
-                prompt_tokens = usage.prompt_tokens,
-                completion_tokens = usage.completion_tokens,
-                "usage"
-            );
-        }
-        let choice = response
-            .choices
-            .into_iter()
-            .next()
-            .ok_or(AgentError::EmptyChoices)?;
-        let text = strip_thinking(choice.message.content.as_deref().unwrap_or(""));
-        let tool_calls = choice.message.tool_calls.clone().unwrap_or_default();
+        let turn = self.chat_stream(request, handler).await?;
 
-                
-        if tool_calls.is_empty() {
-            let answer = if text.trim().is_empty() {
-                "（模型没有返回任何内容，可能是上下文过长或服务端异常）".to_string()
-            } else {
-                text
-            };
-            self.history.push(assistant_message(&answer, Vec::new())?);
-            return Ok(Some(answer));
+        if turn.tool_calls.is_empty() {
+            return Ok(Some(self.finish_answer(turn)?));
         }
 
-        let names: Vec<&str> = tool_calls
-            .iter()
-            .filter_map(|c| match c {
-                ChatCompletionMessageToolCalls::Function(f) => Some(f.function.name.as_str()),
-                _ => None,
-            })
-            .collect();
-        info!(step, finish = ?choice.finish_reason, tools = ?names, "执行工具调用");
+        let tool_calls = turn.to_tool_calls();
+        info!(
+            step,
+            finish = ?turn.finish_reason,
+            tools = ?turn.tool_names(),
+            "执行工具调用"
+        );
 
         // 先把 assistant(tool_calls) 写进历史，顺序不能反
         self.history
-            .push(assistant_message(&text, tool_calls.clone())?);
+            .push(assistant_message(&turn.text, tool_calls.clone())?);
 
         for call in &tool_calls {
             let (call_id, tool_name, arguments) = match call {
@@ -292,22 +294,70 @@ impl Agent {
         Ok(None)
     }
 
-    /// 调用一次 LLM，带超时与友好错误。
-    async fn chat(
+    /// 把这一轮的流式结果收口成最终回答（同时写进历史）。
+    fn finish_answer(&mut self, turn: ChatTurn) -> Result<String> {
+        if let (Some(prompt), Some(completion)) = (turn.prompt_tokens, turn.completion_tokens) {
+            debug!(
+                prompt_tokens = prompt,
+                completion_tokens = completion,
+                "usage"
+            );
+        }
+        let answer = if !turn.text.trim().is_empty() {
+            turn.text.trim().to_string()
+        } else if turn.saw_any_delta {
+            // 只想了没说话：把思考过程当作回答，总比一片空白强
+            let reasoning = turn.reasoning.trim();
+            if reasoning.is_empty() {
+                "（模型没有返回任何内容，可能是上下文过长或服务端异常）".to_string()
+            } else {
+                format!("（模型只输出了思考过程，没有给出最终回答）\n{reasoning}")
+            }
+        } else {
+            "（模型没有返回任何内容，可能是上下文过长或服务端异常）".to_string()
+        };
+        self.history.push(assistant_message(&answer, Vec::new())?);
+        Ok(answer)
+    }
+
+    /// 调用一次流式 LLM 请求，把事件转交给 `handler`，返回整轮结果。
+    ///
+    /// `handler` 不能中途换，所以要 `&mut` 引用；超时由 [`crate::stream`]
+    /// 按“分片间隔”计算，避免长回答被整体超时误杀。
+    async fn chat_stream<H>(
         &self,
         request: CreateChatCompletionRequest,
-    ) -> Result<CreateChatCompletionResponse> {
-        let chat = self.llm.chat();
-        let fut = chat.create(request);
-        match tokio::time::timeout(self.cfg.request_timeout, fut).await {
-            Ok(Ok(resp)) => Ok(resp),
-            Ok(Err(e)) => Err(AgentError::Llm {
-                base_url: self.cfg.base_url.clone(),
-                model: self.cfg.model.clone(),
-                source: Box::new(e),
-            }),
-            Err(_) => Err(AgentError::LlmTimeout(self.cfg.request_timeout.as_secs())),
-        }
+        handler: &mut H,
+    ) -> Result<ChatTurn>
+    where
+        H: ChatStreamHandler + Unpin,
+    {
+        let body = serde_json::to_value(&request)?;
+        // 直连 SSE 时必须自己声明 stream / stream_options：
+        // 只有服务端支持 include_usage 时，末尾才会多出一个带 usage 的块。
+        let body = match body {
+            serde_json::Value::Object(mut map) => {
+                map.insert("stream".to_string(), serde_json::Value::Bool(true));
+                map.insert(
+                    "stream_options".to_string(),
+                    serde_json::json!({ "include_usage": true }),
+                );
+                serde_json::Value::Object(map)
+            }
+            other => other,
+        };
+
+        // 流式请求直连 SSE，但沿用同一个 base_url 规则与连接池
+        let stream = stream::open(
+            self.http.clone(),
+            llm::chat_completions_url(&self.cfg.base_url),
+            body,
+            self.cfg.base_url.clone(),
+            self.cfg.model.clone(),
+            self.cfg.request_timeout,
+            HandlerRef(handler),
+        );
+        stream.collect().await
     }
 
     /// 执行一次 MCP 工具调用，把结果整理成回填给模型的文本。
@@ -353,7 +403,10 @@ impl Agent {
     }
 
     /// 达到步数上限后，禁用工具再问一次，逼模型给出结论。
-    async fn force_final_answer(&mut self) -> Result<String> {
+    async fn force_final_answer<H>(&mut self, handler: &mut H) -> Result<String>
+    where
+        H: ChatStreamHandler + Unpin,
+    {
         self.history.push(user_message(&format!(
             "已达到工具调用步数上限（{} 步）。请不要再调用工具，直接根据目前掌握的信息总结：\
              已经完成了什么、修改了哪些文件、还有什么没做。",
@@ -371,20 +424,14 @@ impl Agent {
             .build()
             .map_err(|e| AgentError::Request(e.to_string()))?;
 
-        let response = self.chat(request).await?;
-        let choice = response
-            .choices
-            .into_iter()
-            .next()
-            .ok_or(AgentError::EmptyChoices)?;
-        let answer = strip_thinking(choice.message.content.as_deref().unwrap_or(""));
-        let answer = if answer.trim().is_empty() {
+        let turn = self.chat_stream(request, handler).await?;
+        let answer = if !turn.text.trim().is_empty() {
+            turn.text.trim().to_string()
+        } else {
             format!(
                 "已达到最大工具调用步数（{} 步）而未能得出最终结论。",
                 self.cfg.max_steps
             )
-        } else {
-            answer
         };
         self.history.push(assistant_message(&answer, Vec::new())?);
         Ok(answer)
@@ -589,6 +636,31 @@ mod tests {
         let err = parse_tool_arguments("{not json").unwrap_err();
         assert!(err.contains("不是合法 JSON"), "{err}");
         assert!(parse_tool_arguments("[1,2,3]").is_err());
+    }
+
+    /// 流式模式下 `finish_answer` 收到的 `ChatTurn::text` 已经是剥离思维链后的正文；
+    /// 这里验证“只有工具调用、正文为空”时不写 `content: ""`（Ollama 会拒绝这种组合）。
+    #[test]
+    fn assistant_message_with_tool_calls_and_no_text_omits_content() {
+        let calls = ChatTurn {
+            tool_calls: vec![("call_1".into(), "read_file".into(), "{}".into())],
+            ..Default::default()
+        }
+        .to_tool_calls();
+        let message = assistant_message("", calls).unwrap();
+        let json = serde_json::to_value(&message).unwrap();
+        assert_eq!(json["role"], "assistant");
+        assert!(json.get("content").is_none(), "{json}");
+        assert_eq!(json["tool_calls"][0]["function"]["name"], "read_file");
+        assert_eq!(json["tool_calls"][0]["id"], "call_1");
+    }
+
+    #[test]
+    fn assistant_message_with_text_keeps_content() {
+        let message = assistant_message("最终回答", Vec::new()).unwrap();
+        let json = serde_json::to_value(&message).unwrap();
+        assert_eq!(json["content"], "最终回答");
+        assert!(json.get("tool_calls").is_none(), "{json}");
     }
 
     #[test]

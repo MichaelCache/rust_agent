@@ -3,6 +3,8 @@
 //! 组成：
 //! - [`agent`]：主循环（LLM ↔ 工具），本文档的核心；
 //! - [`llm`]：Ollama 的 OpenAI 兼容客户端 + 工具 schema 转换；
+//! - [`stream`]：流式对话（思考/正文/工具调用增量 + 事件回调）；
+//! - [`sse`]：OpenAI 兼容接口的 SSE 增量解析；
 //! - [`mcp`]：MCP 客户端（拉起子进程）与 [`mcp::CodeTools`]（工具服务器本体）；
 //! - [`workspace`]：把文件操作限制在工作目录内的沙箱；
 //! - [`text`]：思维链剥离、UTF-8 安全截断等小工具。
@@ -15,11 +17,14 @@ pub mod agent;
 pub mod error;
 pub mod llm;
 pub mod mcp;
+pub mod sse;
+pub mod stream;
 pub mod text;
 pub mod workspace;
 
 pub use agent::{Agent, AgentConfig};
 pub use error::{AgentError, Result};
+pub use stream::{ChatEvent, ChatStream, ChatStreamHandler, ChatTurn, HandlerRef};
 
 /// 初始化 tracing。
 ///

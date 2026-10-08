@@ -125,68 +125,6 @@ cargo run -- -C ./myproj --allow-command just --allow-command ./scripts/build.sh
 cargo run -- -C ./myproj --allow-shell "用 cargo test 2>&1 | tail -30 看失败用例"
 ```
 
-## 相比原实现修了什么
-
-原代码不是“有点问题”，而是**无法编译 + 存在会导致数据损坏/崩溃的逻辑缺陷**。逐条列出：
-
-### 编译层面
-
-1. **模块没接进 crate**：`src/mcp/server.rs`、`src/mcp/tools/edit_code.rs` 从来没有被 `mod` 声明过，`src/mcp.rs` 与 `src/mcp/` 目录还会冲突；`main.rs` 只声明了 `mod agent;`。
-2. **`async-openai 0.42` 的 feature 没开**：该版本默认只启用 `rustls`，`chat-completion` 必须显式打开，否则所有 `ChatCompletion*` 类型都不存在。
-3. **类型路径变了**：0.42 不再把 chat 类型重导出到 `types::` 顶层，要写 `types::chat::…`。
-4. **工具结构变了**：不再有 `ChatCompletionToolType` / `r#type` 字段，而是 `ChatCompletionTools::Function(ChatCompletionTool { function: FunctionObject { .. } })`。
-5. **rmcp 3.5 的 API 变化**：`CallToolRequestParam` → `CallToolRequestParams`（且 `#[non_exhaustive]`，要用 `::new()`）；`ServerHandler::get_info()` 返回的是 `ServerConfig`（`ServerInfo` 已废弃）；`tokio::process::Command`、`Parameters` 等路径也都变了。
-6. **rmcp feature 不全**：少 `transport-child-process`（客户端拉子进程）和 `schemars`（`#[tool]` 生成 JSON Schema 必需）。
-7. **缺依赖**：`serde` / `serde_json` / `regex` / `thiserror` 都没写进 `Cargo.toml`，而代码里在用。
-8. **没有可执行的 server 二进制**：`main.rs` 里写死 `./target/debug/code-tools-server`，但 Cargo 里根本没有这个 target。现在是一个 package 两个 bin（`src/main.rs` + `src/bin/code-tools-server.rs`）。
-
-### 逻辑 / 正确性
-
-9. **`resolve()` 让新建文件永远失败**：`canonicalize()` 对不存在的路径必然报错，所以 `write_file` 新建文件时一定返回“路径无效”。
-10. **`read_file` 越界 panic**：`start_line` 大于文件行数时 `lines[start..end]` 会直接 panic（`start > end`）。
-11. **`search_code` 把普通文本当正则**：查 `fn main() {` 会因 `(` 直接报“正则表达式无效”；现在默认按字面量匹配。
-12. **`edit_file` 静默改错位置**：多处匹配时只替换第一处且不告知；现在会报错列出所有匹配行号，要求补充上下文或显式 `replace_all`。
-13. **工具参数 JSON 解析失败会炸掉整个会话**：`serde_json::from_str(args)?` 直接 `?` 返回；现在把解析错误作为工具结果回填，让模型自我修正。同时兼容本地模型常见的“参数被双重编码成字符串”。
-14. **assistant 消息里硬塞 `content: ""`**：Ollama 对 `content` 为空串 + `tool_calls` 的组合容易报错；现在只有真的有文本才带 `content`。
-15. **思维链污染历史**：Qwen3 是 thinking 模型，思维链标记一旦进入历史会被服务端拒绝；现在回填前统一剥离 ` thinking…`（实测 Ollama 把思维链放在独立的 `reasoning` 字段，async-openai 不会解析它，这里再加一层保险）。**流式改造后**思考内容会以 `ChatEvent::Reasoning` 单独上报给调用方展示，但依然不写回历史。
-16. **不是流式**：原来用 `chat().create()` 一次性拿完整回答，本地模型思考期间屏幕上一个字都没有；现在整条链路（请求 → SSE 解析 → 事件回调 → 终端打印）都是增量的，思考与正文同时实时输出，详见上面「流式输出」。
-17. **`choices[0]` 越界 panic**：改为 `first()` + 明确报错。
-18. **迭代次数用尽后不给结论**：现在会禁用工具再问一次，逼模型总结进展。
-19. **没有超时**：本地 27B 模型可能长时间无响应；现在每次请求都有超时（默认 600s）并且错误信息里带排查提示。
-20. **日志写到 stdout**：MCP 的 stdout 是 JSON-RPC 通道，`tracing_subscriber::fmt::init()` 默认写 stdout，会把协议打乱；现在日志与进度一律走 stderr，stdout 只留最终回答。
-21. **`list_directory` 的 `recursive` 参数被忽略**，且 `entry.file_type().await.unwrap()` 可能 panic；现在真正递归、限制深度与条数、跳过噪声目录。
-22. **越权防护不足**：只在最后做 `starts_with` 检查，符号链接可以穿透（例如工作目录里有个指向 `/etc` 的链接）。现在先做词法归一化、再 canonicalize 最深的已存在祖先，失效符号链接会被直接拒绝。有测试覆盖。
-23. **子进程不绑定工作目录**：原来依赖继承父进程 cwd；现在显式传 `--workspace` 并设置 `current_dir`，父进程退出时也知道要 `cancel()`，不会留孤儿进程。
-24. **历史无限增长**：交互模式聊久了会撑爆模型上下文（直接报错），现在超过 200 条消息时按**完整轮次**丢弃最老的部分（绝不会拆散 `assistant(tool_calls)` 与 `tool` 的配对）。
-
-## 实测
-
-```
-$ ./target/debug/rust_agent -C /tmp/agent_demo --max-steps 3 \
-    "读取 hello.rs，列出里面的 TODO 注释并给出行号"
-
-# stderr：思考过程实时刷新（终端里是暗色竖线），工具调用也跟着报
- 思考中…
-│ Let me find the file first, though the user said hello.rs — so I'll just read it.
-────────────────────────────────────────────────
-⚙ 调用工具 read_file
-INFO 执行工具调用 step=1 finish=Some("tool_calls") tools=["read_file"]
- 思考中…
-│ There's one TODO on line 2.
-────────────────────────────────────────────────
-
-# stdout：最终回答同样是每来一段就直接写出去
-文件 `hello.rs` 中找到的 TODO 注释：
-
-- **第 2 行**：`// TODO: 增加参数校验`
-
-共 1 处 TODO。
-```
-
-行号与文件实际内容一致（模型确实读了文件，而不是凭记忆作答）；思考过程只走 stderr，所以
-`>/tmp/answer.md` 拿到的是干净的回答。`tests/streaming_chat.rs` 里的假 LLM 用例还验证了
-正文是**在服务端仍在生成时就已经到达**，而不是等收尾后一次性吐出。
-
 ## 测试
 
 ```bash

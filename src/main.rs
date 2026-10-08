@@ -1,0 +1,293 @@
+//! `rust_agent`：命令行入口。
+//!
+//! 用法：
+//! ```text
+//! cargo run -- "查看 src/main.rs 里的 TODO 并列出来"
+//! cargo run -- --workspace /path/to/project --max-steps 40 "把 foo() 改名为 bar()"
+//! cargo run                # 无参数进入交互模式
+//! ```
+
+use std::{io::Write, process::ExitCode, time::Duration};
+
+use rust_agent::{
+    Agent, AgentConfig,
+    agent::{
+        DEFAULT_API_KEY, DEFAULT_BASE_URL, DEFAULT_MAX_STEPS, DEFAULT_MODEL, DEFAULT_TIMEOUT_SECS,
+    },
+    init_tracing,
+};
+use tokio::io::{AsyncBufReadExt, BufReader};
+
+const USAGE: &str = "\
+rust_agent — 基于 Ollama(OpenAI 兼容接口) + MCP 工具的代码 Agent
+
+用法:
+  rust_agent [选项] [任务...]     给出任务则执行一次后退出
+  rust_agent [选项]               不带任务则进入交互模式（REPL）
+
+选项:
+  -m, --model <名称>        模型名，默认 qwen3.8:latest（环境变量 AGENT_MODEL）
+      --base-url <URL>      OpenAI 兼容接口地址，默认 http://localhost:11434/v1（环境变量 OPENAI_BASE_URL）
+      --api-key <KEY>       API key，Ollama 不校验，默认 ollama（环境变量 OPENAI_API_KEY）
+  -C, --workspace <目录>    工作目录（读写沙箱根），默认当前目录（环境变量 AGENT_WORKSPACE）
+      --server <路径>       code-tools-server 路径，默认自动查找（环境变量 CODE_TOOLS_SERVER）
+      --max-steps <N>       最多工具调用轮数，默认 25
+      --timeout <秒>        单次 LLM 请求超时，默认 600
+      --temperature <F>     采样温度，默认用服务端默认值
+      --system <提示词>     覆盖默认 system prompt
+      --allow-shell         允许 run_command 执行任意 shell 命令行（管道/重定向）；默认关闭
+      --allow-command <名>  把程序加入 run_command 白名单，可重复使用
+  -q, --quiet               只输出最终回答（关闭 stderr 进度日志）
+  -h, --help                显示本帮助
+
+环境变量:
+  RUST_LOG                  例如 RUST_LOG=rust_agent=debug 看每次工具调用细节
+
+交互模式内置命令:
+  /reset  清空对话上下文    /help  帮助    /exit  退出
+";
+
+const REPL_HELP: &str = "\
+可用命令:
+  /reset   清空对话历史（保留 system prompt）
+  /help    显示本帮助
+  /exit    退出（也可 Ctrl-D）
+其它任意输入都会被当作任务交给 Agent；Agent 会在同一会话里记住上下文。
+";
+
+#[tokio::main]
+async fn main() -> ExitCode {
+    let cli = match Cli::parse(std::env::args().skip(1)) {
+        Ok(cli) => cli,
+        Err(msg) => {
+            eprintln!("参数错误: {msg}\n\n{USAGE}");
+            return ExitCode::from(2);
+        }
+    };
+
+    if cli.help {
+        print!("{USAGE}");
+        return ExitCode::SUCCESS;
+    }
+
+    init_tracing(if cli.quiet {
+        "rust_agent=error,warn"
+    } else {
+        "rust_agent=info,warn"
+    });
+
+    match run(cli).await {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("\n❌ {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+async fn run(cli: Cli) -> rust_agent::Result<()> {
+    let mut agent = Agent::connect(cli.config.clone()).await?;
+
+    eprintln!(
+        "模型: {}  接口: {}\n工作目录: {}\n工具: {}\n命令执行: {}\n",
+        agent.model(),
+        cli.config.base_url,
+        agent.workspace().display(),
+        agent.tool_names().join(", "),
+        if cli.config.allow_shell {
+            "shell 模式（允许管道/重定向，风险自负）".to_string()
+        } else {
+            format!(
+                "白名单 argv 模式（追加程序: {}）",
+                if cli.config.extra_allowed_commands.is_empty() {
+                    "无".to_string()
+                } else {
+                    cli.config.extra_allowed_commands.join(", ")
+                }
+            )
+        }
+    );
+
+    match cli.task {
+        Some(task) => {
+            let answer = agent.ask(&task).await?;
+            println!("{answer}");
+        }
+        None => repl(&mut agent).await?,
+    }
+
+    agent.shutdown().await;
+    Ok(())
+}
+
+async fn repl(agent: &mut Agent) -> rust_agent::Result<()> {
+    eprintln!("交互模式（/help 看命令，Ctrl-D 退出）");
+
+    let mut lines = BufReader::new(tokio::io::stdin()).lines();
+    loop {
+        print!("\n> ");
+        let _ = std::io::stdout().flush();
+
+        let Some(line) = lines.next_line().await? else {
+            eprintln!("\n再见。");
+            return Ok(());
+        };
+        let input = line.trim();
+        if input.is_empty() {
+            continue;
+        }
+
+        match input {
+            "/exit" | "/quit" => {
+                eprintln!("再见。");
+                return Ok(());
+            }
+            "/reset" => {
+                agent.reset();
+                eprintln!("已清空对话历史。");
+                continue;
+            }
+            "/help" => {
+                eprint!("{REPL_HELP}");
+                continue;
+            }
+            _ => {}
+        }
+
+        match agent.ask(input).await {
+            Ok(answer) => println!("\n{answer}"),
+            // 单次任务失败不退出会话，方便直接改参数重试
+            Err(e) => eprintln!("\n❌ {e}"),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 参数解析（手写，避免为一个 CLI 引入 clap）
+// ---------------------------------------------------------------------------
+
+struct Cli {
+    config: AgentConfig,
+    task: Option<String>,
+    quiet: bool,
+    help: bool,
+}
+
+impl Cli {
+    fn parse(args: impl Iterator<Item = String>) -> Result<Self, String> {
+        let mut cfg = AgentConfig {
+            model: env_or("AGENT_MODEL", DEFAULT_MODEL),
+            base_url: env_or("OPENAI_BASE_URL", DEFAULT_BASE_URL),
+            api_key: env_or("OPENAI_API_KEY", DEFAULT_API_KEY),
+            workspace: std::env::var("AGENT_WORKSPACE")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|_| std::env::current_dir().unwrap_or_else(|_| ".".into())),
+            server_bin: std::env::var("CODE_TOOLS_SERVER")
+                .ok()
+                .map(std::path::PathBuf::from),
+            max_steps: DEFAULT_MAX_STEPS,
+            allow_shell: env_flag("CODE_TOOLS_ALLOW_SHELL"),
+            extra_allowed_commands: env_list("CODE_TOOLS_ALLOW_COMMANDS"),
+            temperature: None,
+            request_timeout: Duration::from_secs(DEFAULT_TIMEOUT_SECS),
+            ..Default::default()
+        };
+
+        let mut task_parts: Vec<String> = Vec::new();
+        let mut quiet = false;
+        let mut help = false;
+        let mut args = args.peekable();
+
+        while let Some(arg) = args.next() {
+            let mut take_value = |name: &str| -> Result<String, String> {
+                args.next().ok_or_else(|| format!("{name} 需要一个参数值"))
+            };
+            match arg.as_str() {
+                "-h" | "--help" => help = true,
+                "-q" | "--quiet" => quiet = true,
+                "-m" | "--model" => cfg.model = take_value("--model")?,
+                "--base-url" => cfg.base_url = take_value("--base-url")?,
+                "--api-key" => cfg.api_key = take_value("--api-key")?,
+                "-C" | "--workspace" => {
+                    cfg.workspace = std::path::PathBuf::from(take_value("--workspace")?)
+                }
+                "--server" => cfg.server_bin = Some(take_value("--server")?.into()),
+                "--system" => cfg.system_prompt = Some(take_value("--system")?),
+                "--allow-shell" => cfg.allow_shell = true,
+                "--allow-command" => cfg
+                    .extra_allowed_commands
+                    .push(take_value("--allow-command")?),
+                "--max-steps" => {
+                    cfg.max_steps = take_value("--max-steps")?
+                        .parse()
+                        .map_err(|e| format!("--max-steps 需要正整数: {e}"))?
+                }
+                "--timeout" => {
+                    let secs: u64 = take_value("--timeout")?
+                        .parse()
+                        .map_err(|e| format!("--timeout 需要秒数: {e}"))?;
+                    cfg.request_timeout = Duration::from_secs(secs.max(1));
+                }
+                "--temperature" => {
+                    cfg.temperature = Some(
+                        take_value("--temperature")?
+                            .parse()
+                            .map_err(|e| format!("--temperature 需要数字: {e}"))?,
+                    )
+                }
+                "--" => {
+                    task_parts.extend(args.by_ref());
+                    break;
+                }
+                other if other.starts_with('-') && other.len() > 1 => {
+                    return Err(format!("未知参数 {other}（用 --help 查看用法）"));
+                }
+                other => task_parts.push(other.to_string()),
+            }
+        }
+
+        if cfg.max_steps == 0 {
+            return Err("--max-steps 必须大于 0".to_string());
+        }
+
+        let task = if task_parts.is_empty() {
+            None
+        } else {
+            Some(task_parts.join(" "))
+        };
+
+        Ok(Self {
+            config: cfg,
+            task,
+            quiet,
+            help,
+        })
+    }
+}
+
+fn env_flag(key: &str) -> bool {
+    std::env::var(key)
+        .map(|v| {
+            let v = v.trim().to_ascii_lowercase();
+            !v.is_empty() && v != "0" && v != "false" && v != "no"
+        })
+        .unwrap_or(false)
+}
+
+fn env_list(key: &str) -> Vec<String> {
+    std::env::var(key)
+        .map(|v| {
+            v.split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn env_or(key: &str, default: &str) -> String {
+    std::env::var(key)
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| default.to_string())
+}
